@@ -1,0 +1,1007 @@
+#!/bin/bash
+#
+# scenes: save and restore Hyprland desktop layouts.
+#
+# The engine behind the Scenes plugin for the Omarchy shell. It runs fine on
+# its own too, so hooks, keybindings and scripts can drive it directly.
+#
+#   scenes save <name> [--force]   snapshot every open window
+#   scenes restore <name>          bring a snapshot back
+#   scenes list [--json]           list saved scenes
+#   scenes show <name>             print a scene as JSON
+#   scenes capture                 print the current desktop as scene JSON
+#   scenes rename <name> <new>     rename a scene
+#   scenes delete <name>           delete a scene
+#   scenes autosave                refresh the rolling session snapshot
+#
+# <name> is a scene's name or slug. "previous" is the desktop as it was
+# before the last login (kept by `scenes autosave`).
+
+set -uo pipefail
+
+SCENES_DIR=${OMARCHY_SCENES_DIR:-$HOME/.config/omarchy/scenes}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-scenes
+SETTINGS_FILE=$SCENES_DIR/settings.json
+LAST_SESSION=$STATE_DIR/last-session.json
+PREVIOUS_SESSION=$STATE_DIR/previous-session.json
+ACTIVE_FILE=$STATE_DIR/active.json
+GLYPH="󰿎"
+
+# Programs re-run inside restored terminals. Anything else gets a shell in
+# the same directory. Override with "rerun" in settings.json ("*" = all).
+DEFAULT_RERUN='["nvim","vim","vi","hx","helix","nano","micro","emacs","lazygit","lazydocker","lazysql","gitui","tig","btop","htop","top","yazi","ranger","lf","nnn","mc","tmux","zellij","ssh","mosh","k9s","claude","codex","opencode","aider","gemini","crush"]'
+
+# Windows that are never worth saving: portals, pickers, lock and screensaver.
+DEFAULT_EXCLUDE='^(xdg-desktop-portal.*|org\.freedesktop\.impl\.portal.*|.*polkit.*|hyprland-share-picker|org\.omarchy\.screensaver|Screensaver|hyprlock)$'
+
+SHELLS_RE='^(bash|zsh|fish|sh|dash|nu|xonsh|elvish|tcsh|ksh|mksh|osh|ysh)$'
+
+die() {
+  echo "scenes: $*" >&2
+  exit 1
+}
+
+usage() {
+  sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+now_iso() {
+  date -Iseconds
+}
+
+setting() {
+  # setting <jq-path> <json-default>
+  if [[ -f $SETTINGS_FILE ]]; then
+    jq -c --argjson fallback "$2" "($1) // \$fallback" "$SETTINGS_FILE" 2>/dev/null || printf '%s\n' "$2"
+  else
+    printf '%s\n' "$2"
+  fi
+}
+
+slugify() {
+  local slug
+  slug=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+  [[ -n $slug ]] || slug="scene"
+  [[ $slug == settings || $slug == previous ]] && slug="$slug-scene"
+  printf '%s' "$slug"
+}
+
+# Single-quote one argument for /bin/sh.
+sq() {
+  local s=${1//\'/\'\\\'\'}
+  printf "'%s'" "$s"
+}
+
+# JSON array of strings, safe for arguments that look like options.
+json_array() {
+  if (($#)); then
+    printf '%s\0' "$@" | jq -Rsc 'split("\u0000") | .[:-1]'
+  else
+    echo '[]'
+  fi
+}
+
+quote_argv() {
+  local out="" arg
+  for arg in "$@"; do out+="$(sq "$arg") "; done
+  printf '%s' "${out% }"
+}
+
+# Wrap a string in a Lua long bracket that cannot be closed by its contents.
+lua_str() {
+  local level="="
+  while [[ $1 == *"]${level}]"* ]]; do level+="="; done
+  printf '[%s[%s]%s]' "$level" "$1" "$level"
+}
+
+re_escape() {
+  printf '%s' "$1" | sed 's/[][\\.^$*+?(){}|\/-]/\\&/g'
+}
+
+# ---------------------------------------------------------------- processes
+
+proc_children() {
+  cat /proc/"$1"/task/*/children 2>/dev/null | tr ' ' '\n' | grep -v '^$'
+}
+
+proc_comm() {
+  cat /proc/"$1"/comm 2>/dev/null
+}
+
+proc_cwd() {
+  readlink /proc/"$1"/cwd 2>/dev/null
+}
+
+proc_exe() {
+  readlink /proc/"$1"/exe 2>/dev/null
+}
+
+proc_argv_json() {
+  if [[ -r /proc/$1/cmdline ]]; then
+    jq -Rsc 'split("\u0000") | map(select(length > 0))' </proc/"$1"/cmdline 2>/dev/null || echo '[]'
+  else
+    echo '[]'
+  fi
+}
+
+# Foreground process group of the terminal a shell is attached to.
+proc_tpgid() {
+  local stat rest fields
+  stat=$(cat /proc/"$1"/stat 2>/dev/null) || return
+  rest=${stat##*) }
+  read -ra fields <<<"$rest"
+  printf '%s' "${fields[5]:-0}"
+}
+
+# ---------------------------------------------------------- desktop entries
+
+DESKTOP_INDEX=""
+
+build_desktop_index() {
+  local dirs=() dir
+  dirs+=("${XDG_DATA_HOME:-$HOME/.local/share}/applications")
+  local IFS=:
+  for dir in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do dirs+=("$dir/applications"); done
+  unset IFS
+  dirs+=("/var/lib/flatpak/exports/share/applications" "$HOME/.local/share/flatpak/exports/share/applications")
+
+  local files=()
+  for dir in "${dirs[@]}"; do
+    [[ -d $dir ]] || continue
+    while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$dir" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null)
+  done
+  (( ${#files[@]} )) || return
+
+  # id \t wmclass \t name \t icon \t exec \t url   (first file wins per id)
+  DESKTOP_INDEX=$(awk -F= '
+    FNR == 1 {
+      if (id != "") emit()
+      id = FILENAME; sub(/.*\//, "", id); sub(/\.desktop$/, "", id)
+      section = ""; wm = ""; name = ""; icon = ""; exec = ""; hidden = 0
+    }
+    /^\[/ { section = $0; next }
+    section == "[Desktop Entry]" {
+      key = $1; val = substr($0, length($1) + 2)
+      if (key == "StartupWMClass") wm = val
+      else if (key == "Name") name = val
+      else if (key == "Icon") icon = val
+      else if (key == "Exec" && exec == "") exec = val
+      else if ((key == "Hidden" || key == "NoDisplay") && val == "true") hidden = 1
+    }
+    function emit(   url) {
+      if (seen[id]++) return
+      url = ""
+      if (match(exec, /https?:\/\/[^ "\047]+/)) url = substr(exec, RSTART, RLENGTH)
+      gsub(/\t/, " ", name); gsub(/\t/, " ", exec)
+      printf "%s\t%s\t%s\t%s\t%s\t%s\n", id, wm, name, icon, exec, url
+    }
+    END { if (id != "") emit() }
+  ' "${files[@]}" 2>/dev/null)
+}
+
+# Chromium names an --app=URL window "chrome-<host>_<path with / as _>-<profile>".
+webapp_key() {
+  local url=$1 rest host path
+  rest=${url#*://}
+  rest=${rest%%[?#]*}
+  host=${rest%%/*}
+  if [[ $rest == */* ]]; then path="/${rest#*/}"; else path="/"; fi
+  printf '%s_%s' "$host" "${path//\//_}"
+}
+
+# desktop_lookup <class> <exe-basename> → "id\tname\ticon" or nothing
+desktop_lookup() {
+  [[ -n $DESKTOP_INDEX ]] || return
+  awk -F'\t' -v cls="$1" -v exe="$2" '
+    BEGIN { lc = tolower(cls) }
+    {
+      id = tolower($1)
+      if (id == lc) { byid = $0 }
+      else if ($2 != "" && tolower($2) == lc && bywm == "") { bywm = $0 }
+      else if (exe != "" && byexe == "") {
+        n = split($5, parts, " "); cmd = ""
+        for (i = 1; i <= n; i++) if (parts[i] !~ /=/ && parts[i] != "env") { cmd = parts[i]; break }
+        gsub(/"/, "", cmd); sub(/.*\//, "", cmd)
+        if (cmd == exe) byexe = $0
+      }
+    }
+    END {
+      hit = byid != "" ? byid : (bywm != "" ? bywm : byexe)
+      if (hit != "") { split(hit, f, "\t"); printf "%s\t%s\t%s", f[1], f[3], f[4] }
+    }
+  ' <<<"$DESKTOP_INDEX"
+}
+
+# webapp_lookup <key> → "id\tname\ticon\turl" for the desktop entry whose URL maps to key
+webapp_lookup() {
+  [[ -n $DESKTOP_INDEX ]] || return
+  local id wm name icon exec url
+  while IFS=$'\t' read -r id wm name icon exec url; do
+    [[ -n $url ]] || continue
+    if [[ $(webapp_key "$url") == "$1" ]]; then
+      printf '%s\t%s\t%s\t%s' "$id" "$name" "$icon" "$url"
+      return
+    fi
+  done <<<"$DESKTOP_INDEX"
+}
+
+# ---------------------------------------------------------------- terminals
+
+terminal_default_class() {
+  case $1 in
+  foot | footclient) echo foot ;;
+  alacritty) echo Alacritty ;;
+  kitty) echo kitty ;;
+  ghostty) echo com.mitchellh.ghostty ;;
+  wezterm-gui | wezterm) echo org.wezfurlong.wezterm ;;
+  *) return 1 ;;
+  esac
+}
+
+# Build a terminal argv that opens in $cwd, optionally running a command.
+# terminal_argv <terminal> <class> <cwd> [command...]
+terminal_argv() {
+  local term=$1 class=$2 cwd=$3
+  shift 3
+  local default_class argv=()
+  default_class=$(terminal_default_class "$term")
+  case $term in
+  foot | footclient)
+    argv=("$term")
+    [[ $class != "$default_class" ]] && argv+=("--app-id=$class")
+    argv+=("--working-directory=$cwd")
+    (($#)) && argv+=("$@")
+    ;;
+  alacritty)
+    argv=(alacritty)
+    [[ $class != "$default_class" ]] && argv+=(--class "$class")
+    argv+=(--working-directory "$cwd")
+    (($#)) && argv+=(-e "$@")
+    ;;
+  kitty)
+    argv=(kitty)
+    [[ $class != "$default_class" ]] && argv+=(--class "$class")
+    argv+=(--directory "$cwd")
+    (($#)) && argv+=("$@")
+    ;;
+  ghostty)
+    argv=(ghostty)
+    [[ $class != "$default_class" ]] && argv+=("--class=$class")
+    argv+=("--working-directory=$cwd")
+    (($#)) && argv+=(-e "$@")
+    ;;
+  wezterm-gui | wezterm)
+    argv=(wezterm start --cwd "$cwd")
+    [[ $class != "$default_class" ]] && argv+=(--class "$class")
+    (($#)) && argv+=(-- "$@")
+    ;;
+  esac
+  json_array "${argv[@]}"
+}
+
+rerun_allowed() {
+  local name
+  name=$(basename -- "$1")
+  jq -e --arg name "$name" 'index("*") != null or index($name) != null' <<<"$RERUN" >/dev/null 2>&1
+}
+
+# A terminal's working directory when its process hosts several windows:
+# most prompts put "user@host:~/dir" in the title.
+cwd_from_title() {
+  local dir
+  [[ $1 =~ ^[^@[:space:]]+@[^:[:space:]]+:[[:space:]]*(~?/[^[:space:]]*) ]] || return 1
+  dir=${BASH_REMATCH[1]}
+  dir=${dir/#\~/$HOME}
+  [[ -d $dir ]] && printf '%s' "$dir"
+}
+
+# terminal_info <pid> <title> → JSON {cwd, command, shell, direct}
+terminal_info() {
+  local pid=$1 title=$2 kids=() shell_pid="" cwd="" command='[]' shell="" direct=false
+  mapfile -t kids < <(proc_children "$pid")
+
+  if ((${#kids[@]} == 1)); then
+    shell_pid=${kids[0]}
+    if [[ $(proc_comm "$shell_pid") =~ $SHELLS_RE ]]; then
+      cwd=$(proc_cwd "$shell_pid")
+      shell=$(proc_exe "$shell_pid")
+      local fg
+      fg=$(proc_tpgid "$shell_pid")
+      if [[ -n $fg && $fg -gt 0 && $fg != "$shell_pid" && -d /proc/$fg ]]; then
+        command=$(proc_argv_json "$fg")
+      fi
+    else
+      # Launched straight into a program (e.g. an Omarchy TUI window).
+      direct=true
+      cwd=$(proc_cwd "$shell_pid")
+    fi
+  elif ((${#kids[@]} > 1)); then
+    cwd=$(cwd_from_title "$title") || cwd=""
+  fi
+  [[ -n $cwd ]] || cwd=$HOME
+
+  jq -cn --arg cwd "$cwd" --argjson command "$command" --arg shell "$shell" --argjson direct "$direct" \
+    '{cwd: $cwd, command: $command, shell: $shell, direct: $direct}'
+}
+
+# ------------------------------------------------------------------ capture
+
+browser_bin() {
+  local exe=$1 base candidate
+  base=$(basename -- "$exe")
+  case $base in
+  chromium) candidate=chromium ;;
+  chrome) candidate=google-chrome-stable ;;
+  brave) candidate=brave ;;
+  msedge) candidate=microsoft-edge-stable ;;
+  vivaldi-bin) candidate=vivaldi-stable ;;
+  helium) candidate=helium-browser ;;
+  *) candidate=$base ;;
+  esac
+  command -v "$candidate" 2>/dev/null || printf '%s' "$exe"
+}
+
+is_browser_exe() {
+  [[ $(basename -- "$1") =~ ^(chromium|chrome|brave|msedge|vivaldi-bin|helium|thorium)$ ]]
+}
+
+# describe_window <client-json> → JSON describing how to bring it back
+describe_window() {
+  local client=$1 pid class initial_class title
+  eval "$(jq -r '@sh "pid=\(.pid) class=\(.class) initial_class=\(.initialClass) title=\(.title)"' <<<"$client")"
+
+  local exe exe_base argv kind="app" desktop_id="" app_name="" icon="" cwd="" command='[]' launch='[]' url=""
+  exe=$(proc_exe "$pid")
+  exe_base=$(basename -- "${exe:-unknown}")
+  argv=$(proc_argv_json "$pid")
+
+  local term=""
+  if terminal_default_class "$exe_base" >/dev/null; then
+    term=$exe_base
+    # A foot server hosts footclient windows.
+    [[ $term == foot ]] && jq -e 'index("--server") != null' <<<"$argv" >/dev/null 2>&1 && term=footclient
+  fi
+
+  if [[ -n $term ]]; then
+    kind="terminal"
+    local info direct
+    info=$(terminal_info "$pid" "$title")
+    cwd=$(jq -r .cwd <<<"$info")
+    command=$(jq -c .command <<<"$info")
+    direct=$(jq -r .direct <<<"$info")
+    if [[ $direct == true ]]; then
+      launch=$argv
+    else
+      local inner=() shell
+      if [[ $(jq length <<<"$command") -gt 0 ]] && rerun_allowed "$(jq -r '.[0]' <<<"$command")"; then
+        shell=$(jq -r .shell <<<"$info")
+        [[ -n $shell ]] || shell=${SHELL:-/bin/bash}
+        local cmd_args=()
+        mapfile -t cmd_args < <(jq -r '.[]' <<<"$command")
+        inner=("$shell" -ic "$(quote_argv "${cmd_args[@]}"); exec $(sq "$shell")")
+      fi
+      launch=$(terminal_argv "$term" "$class" "$cwd" "${inner[@]}")
+    fi
+  elif is_browser_exe "$exe" && [[ $class =~ ^(chrome|brave|msedge|vivaldi|helium)-(.+)-(Default|Profile_[0-9]+|Guest_Profile)$ ]]; then
+    local mid=${BASH_REMATCH[2]} profile=${BASH_REMATCH[3]//_/ } browser hit
+    browser=$(browser_bin "$exe")
+    if [[ $mid =~ ^[a-p]{32}$ ]]; then
+      kind="pwa"
+      launch=$(json_array "$browser" "--profile-directory=$profile" "--app-id=$mid")
+    else
+      kind="webapp"
+      hit=$(webapp_lookup "$mid")
+      if [[ -n $hit ]]; then
+        IFS=$'\t' read -r desktop_id app_name icon url <<<"$hit"
+      else
+        # Rebuild the URL from the class: host, then the path with _ for /.
+        local host=${mid%%_*} path=${mid#*_}
+        url="https://$host${path//_//}"
+      fi
+      if command -v omarchy-launch-webapp >/dev/null; then
+        launch=$(json_array omarchy-launch-webapp "$url")
+      else
+        launch=$(json_array "$browser" "--app=$url")
+      fi
+    fi
+  elif is_browser_exe "$exe"; then
+    kind="browser"
+    launch=$(json_array "$(browser_bin "$exe")")
+  else
+    launch=$argv
+  fi
+
+  if [[ -z $desktop_id ]]; then
+    # Browser windows all share one executable, so only plain apps may be
+    # matched by it.
+    local hit by_exe=""
+    [[ $kind == app ]] && by_exe=$exe_base
+    hit=$(desktop_lookup "$class" "$by_exe")
+    [[ -z $hit && $initial_class != "$class" ]] && hit=$(desktop_lookup "$initial_class" "$by_exe")
+    if [[ -n $hit ]]; then
+      local name_hit icon_hit
+      IFS=$'\t' read -r desktop_id name_hit icon_hit <<<"$hit"
+      [[ -n $app_name ]] || app_name=$name_hit
+      [[ -n $icon ]] || icon=$icon_hit
+      # Plain apps start best from their desktop entry; terminals and web
+      # apps keep their richer launch command.
+      [[ $kind == app ]] && launch='[]'
+    fi
+  fi
+  if [[ -z $app_name && $kind == webapp ]]; then
+    app_name=${url#*://}
+    app_name=${app_name%%/*}
+    app_name=${app_name#www.}
+  fi
+  [[ -n $app_name ]] || app_name=$class
+
+  # Nothing we can start again.
+  if [[ -z $desktop_id && $(jq length <<<"$launch") -eq 0 ]]; then
+    kind="unknown"
+  fi
+
+  jq -cn \
+    --arg kind "$kind" --arg desktopId "$desktop_id" --arg app "$app_name" --arg icon "$icon" \
+    --arg cwd "$cwd" --argjson command "$command" --argjson launch "$launch" --arg url "$url" \
+    '{kind: $kind, desktopId: $desktopId, app: $app, icon: $icon, cwd: $cwd, command: $command, launch: $launch, url: $url}
+     | with_entries(select(.value != "" and .value != []))'
+}
+
+capture_json() {
+  need hyprctl
+  local clients monitors active exclude
+  clients=$(hyprctl clients -j) || die "cannot talk to Hyprland"
+  monitors=$(hyprctl monitors -j) || die "cannot talk to Hyprland"
+  active=$(hyprctl activeworkspace -j 2>/dev/null || echo '{}')
+  exclude=$(setting '.exclude' '[]')
+  RERUN=$(setting '.rerun' "$DEFAULT_RERUN")
+  build_desktop_index
+
+  local described=() client
+  while IFS= read -r client; do
+    [[ -n $client ]] || continue
+    described+=("$(describe_window "$client")")
+  done < <(jq -c --arg re "$DEFAULT_EXCLUDE" --argjson exclude "$exclude" '
+    .[]
+    | select(.mapped and (.class // "") != "" and .workspace.id != -1)
+    | select((.class | test($re)) | not)
+    | select(.class as $c | $exclude | index($c) | not)' <<<"$clients")
+
+  local extras
+  extras=$(printf '%s\n' "${described[@]}" | jq -sc '.')
+
+  jq -n \
+    --argjson clients "$clients" --argjson monitors "$monitors" --argjson active "$active" \
+    --argjson extras "$extras" --arg re "$DEFAULT_EXCLUDE" --argjson exclude "$exclude" \
+    --arg now "$(now_iso)" --arg session "${HYPRLAND_INSTANCE_SIGNATURE:-}" '
+    def logical($m): (if ($m.transform % 2) == 1 then [$m.height, $m.width] else [$m.width, $m.height] end)
+                    | map(. / $m.scale | round);
+    ($monitors | map({key: (.id | tostring), value: .}) | from_entries) as $byId
+    | ($clients
+        | map(select(.mapped and (.class // "") != "" and .workspace.id != -1))
+        | map(select((.class | test($re)) | not))
+        | map(select(.class as $c | $exclude | index($c) | not))) as $kept
+    | {
+        version: 1,
+        createdAt: $now,
+        updatedAt: $now,
+        session: $session,
+        focus: {workspace: ($active.name // null), monitor: ($active.monitor // null)},
+        monitors: [$monitors[] | {
+          name, description,
+          x, y,
+          width: logical(.)[0], height: logical(.)[1],
+          scale, transform,
+          activeWorkspace: .activeWorkspace.name,
+          focused
+        }],
+        windows: [range(0; $kept | length) as $i | $kept[$i] as $c | ($byId[$c.monitor | tostring] // {x: 0, y: 0, name: ""}) as $m | {
+          class: $c.class,
+          initialClass: $c.initialClass,
+          title: $c.title,
+          workspace: {id: $c.workspace.id, name: $c.workspace.name},
+          monitor: $m.name,
+          floating: $c.floating,
+          fullscreen: $c.fullscreen,
+          pinned: $c.pinned,
+          at: [($c.at[0] - $m.x), ($c.at[1] - $m.y)],
+          size: $c.size
+        } + $extras[$i]]
+      }
+    | .windows |= sort_by(
+        (if .workspace.name | startswith("special:") then 1 else 0 end),
+        .workspace.id, (if .floating then 1 else 0 end), .at[0], .at[1])'
+}
+
+# -------------------------------------------------------------------- files
+
+scene_file() {
+  # scene_file <name-or-slug> → path of an existing scene
+  local wanted=$1 slug file
+  if [[ $wanted == previous ]]; then
+    # A login hook can ask before the first autosave has rotated sessions.
+    if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+      mkdir -p "$STATE_DIR"
+      (flock 9; rotate_session) 9>"$STATE_DIR/autosave.lock"
+    fi
+    [[ -f $PREVIOUS_SESSION ]] && printf '%s' "$PREVIOUS_SESSION" && return
+    return 1
+  fi
+  [[ -f $wanted ]] && printf '%s' "$wanted" && return
+  slug=$(slugify "$wanted")
+  file=$SCENES_DIR/$slug.json
+  [[ -f $file ]] && printf '%s' "$file" && return
+  # Match by display name, case-insensitively.
+  shopt -s nullglob
+  for file in "$SCENES_DIR"/*.json; do
+    [[ $file == "$SETTINGS_FILE" ]] && continue
+    if [[ $(jq -r '.name // "" | ascii_downcase' "$file" 2>/dev/null) == "${wanted,,}" ]]; then
+      printf '%s' "$file"
+      return
+    fi
+  done
+  return 1
+}
+
+write_json() {
+  # write_json <file> (stdin) — atomic
+  local tmp
+  mkdir -p "$(dirname "$1")"
+  tmp=$(mktemp "$1.XXXXXX") || return 1
+  if jq . >"$tmp"; then
+    mv -f "$tmp" "$1"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# Tell a running Omarchy shell to reload the scene list (bar label, picker).
+ping_shell() {
+  [[ ${SCENES_NO_PING:-} == 1 ]] && return 0
+  command -v omarchy-shell >/dev/null 2>&1 || return 0
+  (omarchy-shell shell call saidness.scenes refresh x >/dev/null 2>&1 &)
+}
+
+set_active() {
+  mkdir -p "$STATE_DIR"
+  jq -n --arg slug "$1" --arg name "$2" --arg at "$(now_iso)" '{slug: $slug, name: $name, at: $at}' | write_json "$ACTIVE_FILE"
+}
+
+cmd_capture() {
+  capture_json
+}
+
+cmd_save() {
+  local name="" force=0
+  while (($#)); do
+    case $1 in
+    -f | --force) force=1 ;;
+    *) name=${name:+$name }$1 ;;
+    esac
+    shift
+  done
+  [[ -n $name ]] || die "usage: scenes save <name> [--force]"
+  local slug file created scene count
+  slug=$(slugify "$name")
+  file=$SCENES_DIR/$slug.json
+  created=$(now_iso)
+  if [[ -f $file ]]; then
+    ((force)) || die "a scene called \"$name\" already exists (use --force to replace it)"
+    created=$(jq -r '.createdAt // empty' "$file" 2>/dev/null)
+    [[ -n $created ]] || created=$(now_iso)
+  fi
+  scene=$(capture_json) || exit 1
+  count=$(jq '.windows | length' <<<"$scene")
+  ((count > 0)) || die "there are no windows to save"
+  jq --arg name "$name" --arg slug "$slug" --arg created "$created" \
+    '.name = $name | .slug = $slug | .createdAt = $created | del(.session)' <<<"$scene" | write_json "$file" || die "could not write $file"
+  set_active "$slug" "$name"
+  ping_shell
+  echo "Saved \"$name\" ($count windows) to $file"
+}
+
+cmd_list() {
+  local json=0
+  [[ ${1:-} == --json ]] && json=1
+  shopt -s nullglob
+  local files=() file
+  for file in "$SCENES_DIR"/*.json; do
+    [[ $file == "$SETTINGS_FILE" ]] && continue
+    files+=("$file")
+  done
+
+  local scenes='[]'
+  if ((${#files[@]})); then
+    scenes=$(for file in "${files[@]}"; do
+      jq -c --arg file "$file" '. + {file: $file, slug: (.slug // ($file | split("/") | last | rtrimstr(".json")))}' "$file" 2>/dev/null
+    done | jq -sc 'sort_by(.updatedAt // "") | reverse')
+  fi
+
+  local previous='null'
+  if [[ -f $PREVIOUS_SESSION ]]; then
+    previous=$(jq -c --arg file "$PREVIOUS_SESSION" \
+      'select((.windows | length) > 0) | . + {file: $file, slug: "previous", name: "Previous session", builtin: true}' \
+      "$PREVIOUS_SESSION" 2>/dev/null)
+    [[ -n $previous ]] || previous='null'
+  fi
+
+  local active='null'
+  [[ -f $ACTIVE_FILE ]] && active=$(jq -c . "$ACTIVE_FILE" 2>/dev/null || echo null)
+
+  if ((json)); then
+    jq -cn --argjson scenes "$scenes" --argjson previous "$previous" --argjson active "$active" \
+      '{scenes: $scenes, previous: $previous, active: $active}'
+    return
+  fi
+
+  if [[ $scenes == '[]' && $previous == null ]]; then
+    echo "No scenes yet. Save one with: scenes save <name>"
+    return
+  fi
+  jq -r '.[] | "\(.name)\t\(.windows | length) windows\t\(.updatedAt)"' <<<"$scenes" | column -t -s $'\t'
+  [[ $previous != null ]] && jq -r '"previous\t\(.windows | length) windows\t\(.updatedAt) (before last login)"' <<<"$previous" | column -t -s $'\t'
+}
+
+cmd_show() {
+  local file
+  file=$(scene_file "${1:-}") || die "no scene called \"${1:-}\""
+  jq . "$file"
+}
+
+cmd_delete() {
+  local file
+  [[ -n ${1:-} ]] || die "usage: scenes delete <name>"
+  file=$(scene_file "$1") || die "no scene called \"$1\""
+  [[ $file == "$PREVIOUS_SESSION" ]] && die "the previous session cannot be deleted"
+  rm -f "$file"
+  if [[ -f $ACTIVE_FILE && $(jq -r .slug "$ACTIVE_FILE" 2>/dev/null) == "$(basename "$file" .json)" ]]; then
+    rm -f "$ACTIVE_FILE"
+  fi
+  ping_shell
+  echo "Deleted $(basename "$file" .json)"
+}
+
+cmd_rename() {
+  local from=${1:-} to=${2:-}
+  [[ -n $from && -n $to ]] || die "usage: scenes rename <name> <new-name>"
+  local file slug target old_slug
+  file=$(scene_file "$from") || die "no scene called \"$from\""
+  [[ $file == "$PREVIOUS_SESSION" ]] && die "the previous session cannot be renamed (save it under a name instead)"
+  old_slug=$(basename "$file" .json)
+  slug=$(slugify "$to")
+  target=$SCENES_DIR/$slug.json
+  [[ $target != "$file" && -f $target ]] && die "a scene called \"$to\" already exists"
+  jq --arg name "$to" --arg slug "$slug" --arg now "$(now_iso)" '.name = $name | .slug = $slug | .updatedAt = $now' "$file" | write_json "$target" || die "could not write $target"
+  [[ $target != "$file" ]] && rm -f "$file"
+  if [[ -f $ACTIVE_FILE && $(jq -r .slug "$ACTIVE_FILE" 2>/dev/null) == "$old_slug" ]]; then
+    set_active "$slug" "$to"
+  fi
+  ping_shell
+  echo "Renamed to \"$to\""
+}
+
+# The rolling snapshot belongs to one Hyprland session. Once a new session
+# starts, the old one's last snapshot becomes the "previous" session.
+rotate_session() {
+  [[ -f $LAST_SESSION ]] || return 0
+  local saved_session
+  saved_session=$(jq -r '.session // ""' "$LAST_SESSION" 2>/dev/null)
+  [[ $saved_session == "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] && return 0
+  if [[ $(jq '.windows | length' "$LAST_SESSION" 2>/dev/null || echo 0) -gt 0 ]]; then
+    mv -f "$LAST_SESSION" "$PREVIOUS_SESSION"
+  else
+    rm -f "$LAST_SESSION"
+  fi
+}
+
+# Keep a rolling snapshot of this login.
+cmd_autosave() {
+  [[ $(setting '.autosave' 'true') == false ]] && return 0
+  mkdir -p "$STATE_DIR"
+  exec 9>"$STATE_DIR/autosave.lock"
+  flock -n 9 || return 0
+
+  rotate_session
+
+  local scene
+  scene=$(capture_json) || return 1
+  # An empty desktop is not worth remembering.
+  [[ $(jq '.windows | length' <<<"$scene") -gt 0 ]] || return 0
+  jq '.name = "Last session" | .slug = "last-session"' <<<"$scene" | write_json "$LAST_SESSION"
+}
+
+# ------------------------------------------------------------------ restore
+
+EMIT_JSONL=0
+
+emit() {
+  ((EMIT_JSONL)) || return 0
+  jq -cn "$@"
+}
+
+say() {
+  ((EMIT_JSONL)) && return 0
+  echo "$@"
+}
+
+hypr_eval() {
+  hyprctl eval "$1" >/dev/null 2>&1
+}
+
+hypr_dispatch() {
+  hyprctl dispatch "$1" >/dev/null 2>&1
+}
+
+disable_rule() {
+  hypr_eval 'if omarchy_scenes_rule then omarchy_scenes_rule:set_enabled(false) end; omarchy_scenes_rule = nil'
+}
+
+workspace_target() {
+  # workspace_target <id> <name>
+  if [[ $2 == special:* ]]; then
+    printf '%s' "$2"
+  elif [[ $1 =~ ^[0-9]+$ && $1 -gt 0 ]]; then
+    printf '%s' "$1"
+  else
+    printf 'name:%s' "$2"
+  fi
+}
+
+launch_command() {
+  # launch_command <entry-json> → shell command string, or nothing
+  local entry=$1 desktop_id kind
+  desktop_id=$(jq -r '.desktopId // ""' <<<"$entry")
+  kind=$(jq -r '.kind // "app"' <<<"$entry")
+  local argv=()
+  mapfile -t argv < <(jq -r '.launch // [] | .[]' <<<"$entry")
+
+  if ((${#argv[@]} == 0)) && [[ -n $desktop_id ]]; then
+    if command -v uwsm-app >/dev/null; then
+      printf 'uwsm-app -- %s' "$(sq "$desktop_id.desktop")"
+    else
+      printf 'gtk-launch %s' "$(sq "$desktop_id")"
+    fi
+    return
+  fi
+  ((${#argv[@]})) || return 1
+  [[ $kind == unknown ]] && return 1
+
+  if command -v uwsm-app >/dev/null && [[ ${argv[0]} != omarchy-launch-* ]]; then
+    printf 'uwsm-app -- %s' "$(quote_argv "${argv[@]}")"
+  else
+    printf 'setsid %s' "$(quote_argv "${argv[@]}")"
+  fi
+}
+
+monitor_origin() {
+  # monitor_origin <name> → "x y" of a connected monitor, or nothing
+  jq -r --arg name "$1" '.[] | select(.name == $name) | "\(.x) \(.y)"' <<<"$MONITORS_NOW"
+}
+
+place_window() {
+  # place_window <address> <entry-json> <target-workspace>
+  local addr=$1 entry=$2 target=$3 floating current_ws current_floating
+  floating=$(jq -r .floating <<<"$entry")
+  read -r current_ws current_floating < <(hyprctl clients -j | jq -r --arg a "$addr" '.[] | select(.address == $a) | "\(.workspace.name) \(.floating)"')
+
+  local target_name=$target
+  [[ $target == name:* ]] && target_name=${target#name:}
+  if [[ $current_ws != "$target_name" ]]; then
+    hypr_dispatch "hl.dsp.window.move({ workspace = $(lua_str "$target"), follow = false, window = \"address:$addr\" })"
+  fi
+
+  if [[ $floating == true ]]; then
+    [[ $current_floating == true ]] || hypr_dispatch "hl.dsp.window.float({ action = \"enable\", window = \"address:$addr\" })"
+    local w h x y origin ox oy
+    read -r w h < <(jq -r '"\(.size[0]) \(.size[1])"' <<<"$entry")
+    hypr_dispatch "hl.dsp.window.resize({ x = $w, y = $h, window = \"address:$addr\" })"
+    origin=$(monitor_origin "$(jq -r '.monitor // ""' <<<"$entry")")
+    if [[ -n $origin ]]; then
+      read -r ox oy <<<"$origin"
+      read -r x y < <(jq -r '"\(.at[0]) \(.at[1])"' <<<"$entry")
+      hypr_dispatch "hl.dsp.window.move({ x = $((ox + x)), y = $((oy + y)), window = \"address:$addr\" })"
+    fi
+  elif [[ $current_floating == true ]]; then
+    hypr_dispatch "hl.dsp.window.float({ action = \"disable\", window = \"address:$addr\" })"
+  fi
+}
+
+# Address of an open, unclaimed window that can stand in for an entry.
+find_adoptable() {
+  local entry=$1 class kind cwd candidates addr pid title
+  class=$(jq -r .class <<<"$entry")
+  kind=$(jq -r '.kind // "app"' <<<"$entry")
+  cwd=$(jq -r '.cwd // ""' <<<"$entry")
+  candidates=$(jq -r --arg c "$class" --argjson claimed "$(claimed_json)" \
+    '.[] | select(.class == $c and (.address as $a | $claimed | index($a) | not)) | "\(.address)\t\(.pid)\t\(.title)"' <<<"$CLIENTS_START")
+  [[ -n $candidates ]] || return 1
+  while IFS=$'\t' read -r addr pid title; do
+    if [[ $kind == terminal && -n $cwd ]]; then
+      local info
+      info=$(terminal_info "$pid" "$title")
+      [[ $(jq -r .cwd <<<"$info") == "$cwd" ]] || continue
+    fi
+    printf '%s' "$addr"
+    return 0
+  done <<<"$candidates"
+  return 1
+}
+
+CLAIMED=()
+
+claimed_json() {
+  if ((${#CLAIMED[@]})); then
+    json_array "${CLAIMED[@]}"
+  else
+    echo '[]'
+  fi
+}
+
+wait_for_window() {
+  # wait_for_window <class> <initial-class> <known-json> <timeout-seconds> → address
+  local class=$1 initial=$2 known=$3 timeout=$4 deadline addr
+  deadline=$((SECONDS + timeout))
+  while ((SECONDS < deadline)); do
+    addr=$(hyprctl clients -j 2>/dev/null | jq -r --arg c "$class" --arg i "$initial" --argjson known "$known" '
+      [.[] | select((.address as $a | $known | index($a) | not) and (.class == $c or .initialClass == $i or .initialClass == $c))]
+      | first | .address // empty')
+    if [[ -n $addr ]]; then
+      printf '%s' "$addr"
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+cmd_restore() {
+  local wanted="" adopt=1 focus=1 notify=0
+  while (($#)); do
+    case $1 in
+    --jsonl) EMIT_JSONL=1 ;;
+    --notify) notify=1 ;;
+    --no-adopt) adopt=0 ;;
+    --no-focus) focus=0 ;;
+    *) wanted=${wanted:+$wanted }$1 ;;
+    esac
+    shift
+  done
+  [[ -n $wanted ]] || die "usage: scenes restore <name> [--no-adopt] [--no-focus] [--notify]"
+  need hyprctl
+
+  local file
+  file=$(scene_file "$wanted") || die "no scene called \"$wanted\""
+
+  mkdir -p "$STATE_DIR"
+  exec 8>"$STATE_DIR/restore.lock"
+  flock -n 8 || die "another restore is already running"
+
+  local scene name slug total timeout
+  scene=$(jq -c . "$file") || die "could not read $file"
+  name=$(jq -r '.name // "Scene"' <<<"$scene")
+  slug=$(jq -r '.slug // "scene"' <<<"$scene")
+  [[ $file == "$PREVIOUS_SESSION" ]] && name="Previous session" && slug="previous"
+  total=$(jq '.windows | length' <<<"$scene")
+  timeout=$(setting '.launchTimeout' '15')
+  [[ $timeout =~ ^[0-9]+$ ]] || timeout=15
+
+  CLIENTS_START=$(hyprctl clients -j) || die "cannot talk to Hyprland"
+  MONITORS_NOW=$(hyprctl monitors -j)
+  RERUN=$(setting '.rerun' "$DEFAULT_RERUN")
+  local known
+  known=$(jq -c 'map(.address)' <<<"$CLIENTS_START")
+
+  emit --arg name "$name" --arg slug "$slug" --argjson total "$total" '{event: "start", name: $name, slug: $slug, total: $total}'
+  say "Restoring \"$name\" ($total windows)"
+
+  local launched=0 adopted=0 failed=0 i=0 started=$SECONDS entry
+  trap disable_rule EXIT
+
+  while IFS= read -r entry; do
+    i=$((i + 1))
+    local class app ws_id ws_name target status addr=""
+    class=$(jq -r .class <<<"$entry")
+    app=$(jq -r '.app // .class' <<<"$entry")
+    ws_id=$(jq -r .workspace.id <<<"$entry")
+    ws_name=$(jq -r .workspace.name <<<"$entry")
+    target=$(workspace_target "$ws_id" "$ws_name")
+
+    emit --argjson index "$i" --arg app "$app" --arg workspace "$ws_name" \
+      '{event: "window", index: $index, status: "working", app: $app, workspace: $workspace}'
+
+    if ((adopt)) && addr=$(find_adoptable "$entry"); then
+      CLAIMED+=("$addr")
+      place_window "$addr" "$entry" "$target"
+      status="adopted"
+      adopted=$((adopted + 1))
+    else
+      local cmd
+      if ! cmd=$(launch_command "$entry"); then
+        status="skipped"
+        failed=$((failed + 1))
+      else
+        local initial rule floating
+        initial=$(jq -r '.initialClass // .class' <<<"$entry")
+        floating=$(jq -r .floating <<<"$entry")
+        rule="match = { class = $(lua_str "^($(re_escape "$class")|$(re_escape "$initial"))\$") }, workspace = $(lua_str "$target silent")"
+        if [[ $floating == true ]]; then
+          rule+=", float = true, size = { $(jq -r '"\(.size[0]), \(.size[1])"' <<<"$entry") }, move = { $(jq -r '"\(.at[0]), \(.at[1])"' <<<"$entry") }"
+        else
+          rule+=", tile = true"
+        fi
+        hypr_eval "if omarchy_scenes_rule then omarchy_scenes_rule:set_enabled(false) end; omarchy_scenes_rule = hl.window_rule({ $rule })"
+        hypr_eval "hl.exec_cmd($(lua_str "$cmd"))"
+
+        if addr=$(wait_for_window "$class" "$initial" "$known" "$timeout"); then
+          CLAIMED+=("$addr")
+          known=$(jq -c --arg a "$addr" '. + [$a]' <<<"$known")
+          # Apps that open their window from an already-running process can
+          # slip past the rule; put them where they belong anyway.
+          place_window "$addr" "$entry" "$target"
+          status="launched"
+          launched=$((launched + 1))
+        else
+          status="timeout"
+          failed=$((failed + 1))
+        fi
+        disable_rule
+      fi
+    fi
+
+    emit --argjson index "$i" --arg app "$app" --arg workspace "$ws_name" --arg status "$status" \
+      '{event: "window", index: $index, status: $status, app: $app, workspace: $workspace}'
+    say "  [$i/$total] $app → $ws_name: $status"
+  done < <(jq -c '.windows[]' <<<"$scene")
+
+  if ((focus)); then
+    # Bring each monitor back to the workspace it showed, ending on the one
+    # that had focus.
+    local ws
+    while IFS= read -r ws; do
+      [[ -n $ws ]] && hypr_dispatch "hl.dsp.focus({ workspace = $(lua_str "$ws") })"
+    done < <(jq -r '
+      [.monitors[]? | select(.activeWorkspace != null and (.activeWorkspace | startswith("special:") | not))]
+      | sort_by(.focused) | .[].activeWorkspace' <<<"$scene")
+  fi
+
+  [[ $slug != previous ]] && set_active "$slug" "$name"
+  ping_shell
+
+  local seconds=$((SECONDS - started))
+  emit --arg name "$name" --argjson launched "$launched" --argjson adopted "$adopted" --argjson failed "$failed" --argjson seconds "$seconds" \
+    '{event: "done", name: $name, launched: $launched, adopted: $adopted, failed: $failed, seconds: $seconds}'
+  say "Done: $launched opened, $adopted already open, $failed failed (${seconds}s)"
+
+  if ((notify)) && command -v omarchy-notification-send >/dev/null; then
+    local parts=()
+    ((launched)) && parts+=("$launched opened")
+    ((adopted)) && parts+=("$adopted already open")
+    ((failed)) && parts+=("$failed didn't start")
+    ((${#parts[@]})) || parts+=("nothing to do")
+    local body
+    body=$(IFS=,; echo "${parts[*]}" | sed 's/,/ · /g')
+    omarchy-notification-send -g "$GLYPH" "$name" "$body" >/dev/null 2>&1 || true
+  fi
+}
+
+# --------------------------------------------------------------------- main
+
+need jq
+
+case ${1:-} in
+capture) shift; cmd_capture "$@" ;;
+save) shift; cmd_save "$@" ;;
+restore) shift; cmd_restore "$@" ;;
+list | ls) shift; cmd_list "$@" ;;
+show) shift; cmd_show "$@" ;;
+delete | rm) shift; cmd_delete "$@" ;;
+rename | mv) shift; cmd_rename "$@" ;;
+autosave) shift; cmd_autosave "$@" ;;
+-h | --help | help | "") usage ;;
+*) die "unknown command: $1 (try: scenes --help)" ;;
+esac

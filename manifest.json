@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "id": "saidness.scenes",
+  "name": "Scenes",
+  "version": "1.0.0",
+  "author": "saidness",
+  "license": "MIT",
+  "description": "Save your desktop as a scene (every window, workspace, terminal directory and running TUI) and bring it all back with one key. Remembers the session before your last login too.",
+  "kinds": [
+    "service",
+    "overlay",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "overlay": "Overlay.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Scenes",
+    "description": "Shows the active scene and opens the Scenes picker. Left click opens it, right click saves the current layout.",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showName": true
+    },
+    "schema": [
+      {
+        "key": "showName",
+        "type": "boolean",
+        "label": "Show scene name",
+        "description": "Show the name of the last saved or restored scene next to the icon.",
+        "defaultValue": true
+      }
+    ]
+  }
+}
