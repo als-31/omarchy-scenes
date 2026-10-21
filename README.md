@@ -48,7 +48,8 @@ o.bind("SUPER + CTRL + SHIFT + S", "Save scene", "omarchy-shell shell summon sai
 
 ## Using it
 
-Open the picker with `Super + Ctrl + Alt + S` or a click on the bar button.
+Open the picker with `Super + Ctrl + Alt + S` or by clicking the Scenes icon.
+Click the active scene's name to restore it immediately.
 
 | Key | In the picker |
 | --- | --- |
@@ -64,8 +65,9 @@ While naming a scene, `Tab` takes the suggested name: the project most of
 your terminals are in.
 
 The bar button shows the active scene, and restore progress while one comes
-back. Right click it to save the current layout. Turn the name off in the
-widget's settings (`showName`) if you want just the icon.
+back. Right click either the icon or scene name to save the current layout.
+Turn the name off in the widget's settings (`showName`) if you want just the
+icon.
 
 ## Command line
 

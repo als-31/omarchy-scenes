@@ -4,10 +4,9 @@ import qs.Ui
 import "SceneModel.js" as SceneModel
 import "Glyphs.js" as Glyphs
 
-// Bar button: the clapperboard plus the active scene's name, or restore
-// progress while a scene is coming back.
-//   left click   open the Scenes picker
-//   right click  save the current layout
+// Bar button: the clapperboard opens the picker, while the active scene's
+// name restores that scene. Restore progress replaces the name while a scene
+// is coming back. Right-clicking either button saves the current layout.
 BarWidget {
   id: root
   moduleName: "saidness.scenes"
@@ -19,13 +18,12 @@ BarWidget {
   readonly property bool showName: setting("showName", true) !== false
   readonly property string activeName: service ? service.activeName : ""
 
-  readonly property string label: {
+  readonly property string statusText: {
     if (root.restoring) {
       var total = root.service.restoreTotal
-      return Glyphs.scene + "  " + (total > 0 ? root.service.restoreIndex + "/" + total : "…")
+      return total > 0 ? root.service.restoreIndex + "/" + total : "…"
     }
-    if (root.showName && root.activeName && !root.vertical) return Glyphs.scene + "  " + SceneModel.ellipsize(root.activeName, 18)
-    return Glyphs.scene
+    return SceneModel.ellipsize(root.activeName, 18)
   }
 
   readonly property string tooltip: {
@@ -46,19 +44,46 @@ BarWidget {
       root.bar.run("omarchy-shell shell toggle " + root.pluginId + " '" + json + "'")
   }
 
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
+  implicitWidth: iconButton.implicitWidth + (sceneButton.visible ? sceneButton.implicitWidth : 0)
+  implicitHeight: Math.max(iconButton.implicitHeight, sceneButton.implicitHeight)
 
-  WidgetButton {
-    id: button
+  Row {
     anchors.fill: parent
-    bar: root.bar
-    text: root.label
-    tooltipText: root.tooltip
-    active: root.restoring
-    onPressed: function(mouseButton) {
-      if (mouseButton === Qt.RightButton) root.summon({ mode: "save" })
-      else root.summon(null)
+    spacing: 0
+
+    WidgetButton {
+      id: iconButton
+      bar: root.bar
+      text: Glyphs.scene
+      tooltipText: "Manage Scenes"
+      active: root.restoring
+
+      onPressed: function(mouseButton) {
+        if (mouseButton === Qt.RightButton)
+          root.summon({ mode: "save" })
+        else
+          root.summon(null)
+      }
+    }
+
+    WidgetButton {
+      id: sceneButton
+      visible: root.restoring || (root.showName && !!root.activeName && !root.vertical)
+      bar: root.bar
+      text: root.statusText
+      tooltipText: root.restoring ? root.tooltip : "Restore " + root.activeName
+      active: root.restoring
+
+      onPressed: function(mouseButton) {
+        if (mouseButton === Qt.RightButton)
+          root.summon({ mode: "save" })
+        else if (root.restoring)
+          root.summon(null)
+        else if (root.service && root.service.activeSlug)
+          root.service.restore(root.service.activeSlug)
+        else
+          root.summon(null)
+      }
     }
   }
 }

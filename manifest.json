@@ -19,7 +19,7 @@
   },
   "barWidget": {
     "displayName": "Scenes",
-    "description": "Shows the active scene and opens the Scenes picker. Left click opens it, right click saves the current layout.",
+    "description": "Shows the active scene. Click the icon to open the picker, click the name to restore, or right click to save the current layout.",
     "category": "Compositor",
     "allowMultiple": false,
     "defaultSection": "right",
